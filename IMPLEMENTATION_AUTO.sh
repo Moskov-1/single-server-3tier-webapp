@@ -3,15 +3,34 @@
 ################################################################################
 # BMI Health Tracker - Complete Deployment Script for AWS EC2 Ubuntu
 #
-# This script automates the ENTIRE deployment process based on the
-# BMI_Health_Tracker_Deployment_Readme.md manual deployment guide.
+# This script automates the ENTIRE deployment process including SSL certificate
+# installation based on the BMI_Health_Tracker_Deployment_Readme.md guide.
 #
-# Usage: ./deploy.sh [--skip-nginx] [--skip-backup]
+# Usage: ./IMPLEMENTATION_AUTO.sh [OPTIONS]
+#
+# Basic Usage:
+#   ./IMPLEMENTATION_AUTO.sh                                    # Deploy without SSL
+#   ./IMPLEMENTATION_AUTO.sh --with-ssl                         # Deploy with SSL (interactive)
+#   ./IMPLEMENTATION_AUTO.sh --with-ssl --domain=example.com    # Deploy with SSL (domain specified)
 #
 # Options:
-#   --skip-nginx   : Skip Nginx configuration (if already configured)
-#   --skip-backup  : Skip creating backup of current deployment
-#   --fresh        : Fresh deployment (clean install)
+#   --skip-nginx              : Skip Nginx configuration (if already configured)
+#   --skip-backup             : Skip creating backup of current deployment
+#   --fresh                   : Fresh deployment (clean install)
+#   --with-ssl                : Enable SSL certificate installation with Let's Encrypt
+#   --skip-ssl                : Skip SSL certificate setup entirely
+#   --domain=YOUR_DOMAIN      : Specify domain name for SSL (e.g., --domain=bmi.example.com)
+#   --help                    : Show this help message
+#
+# Examples:
+#   ./IMPLEMENTATION_AUTO.sh --fresh
+#   ./IMPLEMENTATION_AUTO.sh --with-ssl --domain=bmi.ostaddevops.click
+#   ./IMPLEMENTATION_AUTO.sh --skip-backup --with-ssl
+#
+# Prerequisites for SSL:
+#   - Domain name with A record pointing to this server's public IP
+#   - Ports 80 and 443 open in security group and firewall
+#   - Valid email address for Let's Encrypt notifications
 ################################################################################
 
 set -e  # Exit on any error
@@ -36,10 +55,17 @@ DB_PASSWORD=""
 DB_HOST="localhost"
 DB_PORT="5432"
 
+# SSL Configuration
+SSL_ENABLED=false
+DOMAIN_NAME=""
+LETSENCRYPT_EMAIL=""
+
 # Parse command line arguments
 SKIP_NGINX=false
 SKIP_BACKUP=false
 FRESH_DEPLOY=false
+SKIP_SSL=false
+ENABLE_SSL=false
 
 for arg in "$@"; do
     case $arg in
@@ -55,14 +81,33 @@ for arg in "$@"; do
             FRESH_DEPLOY=true
             shift
             ;;
+        --skip-ssl)
+            SKIP_SSL=true
+            shift
+            ;;
+        --with-ssl)
+            ENABLE_SSL=true
+            shift
+            ;;
+        --domain=*)
+            DOMAIN_NAME="${arg#*=}"
+            shift
+            ;;
         --help)
-            echo "Usage: ./deploy.sh [OPTIONS]"
+            echo "Usage: ./IMPLEMENTATION_AUTO.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --skip-nginx    Skip Nginx configuration"
-            echo "  --skip-backup   Skip creating backup"
-            echo "  --fresh         Fresh deployment (clean install)"
-            echo "  --help          Show this help message"
+            echo "  --skip-nginx              Skip Nginx configuration"
+            echo "  --skip-backup             Skip creating backup"
+            echo "  --fresh                   Fresh deployment (clean install)"
+            echo "  --skip-ssl                Skip SSL certificate installation"
+            echo "  --with-ssl                Enable SSL certificate installation"
+            echo "  --domain=YOUR_DOMAIN      Specify domain name for SSL"
+            echo "  --help                    Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  ./IMPLEMENTATION_AUTO.sh --with-ssl --domain=bmi.example.com"
+            echo "  ./IMPLEMENTATION_AUTO.sh --fresh --skip-ssl"
             exit 0
             ;;
     esac
@@ -775,6 +820,129 @@ EOF
 }
 
 ################################################################################
+# SSL Certificate Setup
+################################################################################
+
+setup_ssl_certificate() {
+    if [ "$SKIP_SSL" = true ]; then
+        print_info "Skipping SSL certificate setup (--skip-ssl flag set)"
+        return 0
+    fi
+    
+    if [ "$ENABLE_SSL" = false ]; then
+        print_info "SSL setup not requested. Use --with-ssl to enable."
+        print_info "You can manually run: sudo certbot --nginx -d YOUR_DOMAIN later"
+        return 0
+    fi
+    
+    print_header "Setting Up SSL Certificate"
+    
+    # Check if certbot is installed
+    if ! command -v certbot &> /dev/null; then
+        print_info "Installing certbot..."
+        sudo apt update -qq
+        sudo apt install -y certbot python3-certbot-nginx
+        print_success "Certbot installed"
+    else
+        print_success "Certbot is already installed"
+    fi
+    
+    # Get domain name if not provided
+    if [ -z "$DOMAIN_NAME" ]; then
+        echo ""
+        echo "Please enter your domain name for SSL certificate:"
+        echo "Example: bmi.example.com"
+        echo "Note: DNS must already be pointing to this server"
+        echo ""
+        read -p "Domain name (leave empty to skip SSL): " DOMAIN_NAME
+        
+        if [ -z "$DOMAIN_NAME" ]; then
+            print_warning "No domain provided, skipping SSL setup"
+            return 0
+        fi
+    fi
+    
+    # Validate domain format
+    if [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?\.[a-zA-Z]{2,}$ ]] && [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}$ ]]; then
+        print_error "Invalid domain format: $DOMAIN_NAME"
+        print_warning "Skipping SSL setup. You can run manually later with:"
+        print_warning "  sudo certbot --nginx -d $DOMAIN_NAME"
+        return 0
+    fi
+    
+    # Check DNS resolution
+    print_info "Checking DNS resolution for $DOMAIN_NAME..."
+    if ! nslookup "$DOMAIN_NAME" > /dev/null 2>&1 && ! dig "$DOMAIN_NAME" +short > /dev/null 2>&1; then
+        print_warning "DNS resolution check inconclusive for $DOMAIN_NAME"
+        print_warning "Make sure your domain's A record points to this server"
+        read -p "Continue with SSL setup anyway? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Skipping SSL setup"
+            return 0
+        fi
+    else
+        print_success "DNS resolution successful"
+    fi
+    
+    # Update Nginx configuration with domain name
+    print_info "Updating Nginx configuration with domain name..."
+    NGINX_CONFIG="/etc/nginx/sites-available/bmi-health-tracker"
+    
+    if [ -f "$NGINX_CONFIG" ]; then
+        sudo sed -i "s/server_name .*/server_name $DOMAIN_NAME;/" "$NGINX_CONFIG"
+        sudo nginx -t && sudo systemctl reload nginx
+        print_success "Nginx configuration updated with domain: $DOMAIN_NAME"
+    else
+        print_error "Nginx configuration not found"
+        return 1
+    fi
+    
+    # Get email for Let's Encrypt
+    if [ -z "$LETSENCRYPT_EMAIL" ]; then
+        echo ""
+        echo "Enter email address for Let's Encrypt notifications:"
+        read -p "Email: " LETSENCRYPT_EMAIL
+    fi
+    
+    if [ -z "$LETSENCRYPT_EMAIL" ]; then
+        print_error "Email is required for Let's Encrypt"
+        return 1
+    fi
+    
+    # Request certificate
+    print_info "Requesting SSL certificate from Let's Encrypt..."
+    print_info "This may take a minute..."
+    
+    if sudo certbot --nginx -d "$DOMAIN_NAME" --non-interactive --agree-tos --email "$LETSENCRYPT_EMAIL" --redirect; then
+        print_success "SSL certificate installed successfully!"
+        print_success "Your site is now accessible via HTTPS"
+        
+        # Test auto-renewal
+        print_info "Testing automatic renewal..."
+        if sudo certbot renew --dry-run > /dev/null 2>&1; then
+            print_success "Auto-renewal test passed"
+        else
+            print_warning "Auto-renewal test failed, but certificate is installed"
+        fi
+        
+        # Store domain for summary
+        SSL_ENABLED=true
+        
+    else
+        print_error "SSL certificate installation failed"
+        print_warning "Common issues:"
+        print_warning "  1. DNS not pointing to this server"
+        print_warning "  2. Port 80/443 not accessible from internet"
+        print_warning "  3. Domain already has certificate elsewhere"
+        print_warning ""
+        print_info "You can retry manually with:"
+        print_info "  sudo certbot --nginx -d $DOMAIN_NAME"
+        return 1
+    fi
+}
+
+################################################################################
 # Health Checks
 ################################################################################
 
@@ -836,11 +1004,24 @@ display_summary() {
     echo -e "${GREEN}✓ Frontend built and deployed to Nginx${NC}"
     echo -e "${GREEN}✓ Database migrations applied${NC}"
     echo -e "${GREEN}✓ Nginx configured and running${NC}"
+    
+    if [ "$SSL_ENABLED" = true ] && [ -n "$DOMAIN_NAME" ]; then
+        echo -e "${GREEN}✓ SSL certificate installed${NC}"
+    fi
+    
     echo -e "${GREEN}✓ Health checks completed${NC}"
     echo ""
     
     print_info "Application Access:"
-    echo "  URL: http://$SERVER_IP"
+    if [ "$SSL_ENABLED" = true ] && [ -n "$DOMAIN_NAME" ]; then
+        echo "  HTTPS URL: https://$DOMAIN_NAME"
+        echo "  (HTTP redirects to HTTPS automatically)"
+    else
+        echo "  HTTP URL: http://$SERVER_IP"
+        if [ -n "$DOMAIN_NAME" ]; then
+            echo "  or: http://$DOMAIN_NAME"
+        fi
+    fi
     echo ""
     
     print_info "Useful Commands:"
@@ -851,6 +1032,12 @@ display_summary() {
     echo "  Test Nginx config:       sudo nginx -t"
     echo "  Restart Nginx:           sudo systemctl restart nginx"
     echo "  Connect to database:     psql -U bmi_user -d bmidb -h localhost"
+    
+    if [ "$SSL_ENABLED" = true ]; then
+        echo "  Renew SSL cert:          sudo certbot renew"
+        echo "  Check SSL status:        sudo certbot certificates"
+    fi
+    
     echo ""
     
     print_info "Backup Location:"
@@ -859,9 +1046,17 @@ display_summary() {
     
     print_warning "Next Steps:"
     echo "  1. Test the application in your browser"
-    echo "  2. Configure SSL with: sudo certbot --nginx -d YOUR_DOMAIN"
-    echo "  3. Monitor logs for any issues"
-    echo "  4. Set up regular database backups"
+    
+    if [ "$SSL_ENABLED" != true ]; then
+        echo "  2. Configure SSL with: sudo certbot --nginx -d YOUR_DOMAIN"
+        echo "     (or re-run this script with --with-ssl)"
+        echo "  3. Monitor logs for any issues"
+        echo "  4. Set up regular database backups"
+    else
+        echo "  2. Monitor logs for any issues"
+        echo "  3. Set up regular database backups"
+        echo "  4. Certificate auto-renews (expires in 90 days)"
+    fi
     echo ""
 }
 
@@ -878,6 +1073,9 @@ main() {
     [ "$SKIP_NGINX" = true ] && echo "  - Skipping Nginx configuration"
     [ "$SKIP_BACKUP" = true ] && echo "  - Skipping backup"
     [ "$FRESH_DEPLOY" = true ] && echo "  - Fresh deployment (clean install)"
+    [ "$ENABLE_SSL" = true ] && echo "  - SSL certificate will be installed"
+    [ "$SKIP_SSL" = true ] && echo "  - Skipping SSL setup"
+    [ -n "$DOMAIN_NAME" ] && echo "  - Domain: $DOMAIN_NAME"
     echo ""
     
     read -p "Continue with deployment? (y/n): " -n 1 -r
@@ -897,6 +1095,7 @@ main() {
     deploy_frontend
     setup_pm2
     configure_nginx
+    setup_ssl_certificate
     run_health_checks
     display_summary
     
