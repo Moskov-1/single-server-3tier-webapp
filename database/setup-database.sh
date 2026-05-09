@@ -27,7 +27,8 @@ NC='\033[0m' # No Color
 # Configuration
 DB_USER="bmi_user"
 DB_NAME="bmidb"
-DB_VERSION="14"  # PostgreSQL version
+# DB_VERSION="14"  # PostgreSQL version
+DB_VERSION="18"  # PostgreSQL version
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,9 +93,10 @@ install_postgresql() {
     apt update -qq
     
     print_info "Installing PostgreSQL $DB_VERSION..."
-    apt install -y postgresql-$DB_VERSION postgresql-contrib-$DB_VERSION
+    # apt install -y postgresql-$DB_VERSION postgresql-contrib-$DB_VERSION
+    apt install -y postgresql postgresql-contrib-$DB_VERSION
     
-    print_success "PostgreSQL $DB_VERSION installed successfully"
+    print_success "PostgreSQL Latest installed successfully"
 }
 
 ################################################################################
@@ -223,6 +225,7 @@ configure_postgresql() {
 local   $DB_NAME        $DB_USER                                md5
 host    $DB_NAME        $DB_USER        127.0.0.1/32            md5
 host    $DB_NAME        $DB_USER        ::1/128                 md5
+host    $DB_NAME        $DB_USER        10.0.0.0/16             md5
 EOF
         print_success "Updated pg_hba.conf for password authentication"
     fi
